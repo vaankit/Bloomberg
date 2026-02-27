@@ -968,6 +968,8 @@
                 <button class="qb special" onclick="run('CMDTY')">CMDTY</button>
                 <button class="qb special" onclick="run('MACRO')">MACRO</button>
                 <button class="qb special" onclick="run('HELP')">HELP</button>
+                <button class="qb special" style="border-color:#550055;color:#ff44ff;" onclick="run('DIAG')">⚙ DIAG</button>
+                <button class="qb special" style="border-color:#555500;color:#ffff44;" onclick="run('TEST LT.NS')">TEST LT.NS</button>
             </div>
 
             <div class="output" id="output">
@@ -1200,90 +1202,313 @@ function toEODHD(symbol) {
 }
 
 // ═══ API FETCHING ════════════════════════════════
-async function fetchQuote(symbol) {
-    const exInfo = getExchangeInfo(symbol);
-    const isIntl = exInfo.suffix !== '';
 
-    // 1. Try EODHD (best for international)
-    if (ST.keys.eodhd) {
-        try {
-            const eSym = toEODHD(symbol);
-            const r = await fetch(`https://eodhd.com/api/real-time/${eSym}?api_token=${ST.keys.eodhd}&fmt=json`);
-            const d = await r.json();
-            if (d && d.close && d.close !== 'NA') {
-                return {
-                    price: parseFloat(d.close), change: parseFloat(d.change)||0,
-                    changePct: parseFloat(d.change_p)||0, open: parseFloat(d.open)||0,
-                    high: parseFloat(d.high)||0, low: parseFloat(d.low)||0,
-                    prevClose: parseFloat(d.previousClose)||0, volume: parseFloat(d.volume)||0,
-                    source: 'EODHD'
-                };
-            }
-        } catch(e) {}
+// Build all symbol variants to try for a given input
+function getSymbolVariants(symbol) {
+    const s = symbol.toUpperCase().trim();
+    const variants = [s]; // always try as-is first
+
+    // Indian NSE/BSE special handling
+    if (s.endsWith('.NS') || s.endsWith('.BO')) {
+        const base = s.replace(/\.(NS|BO)$/, '');
+        const exch = s.endsWith('.NS') ? 'NS' : 'BO';
+        // Some providers want NSE:SYMBOL format
+        variants.push(`NSE:${base}`, `BSE:${base}`);
+        // Some want just base name
+        variants.push(base);
+        // Finnhub uses different format for Indian stocks - try both
+        variants.push(`${base}.NS`, `${base}.BO`);
     }
 
-    // 2. Try Twelve Data (good for all markets)
-    if (ST.keys.twelve) {
-        try {
-            const r = await fetch(`https://api.twelvedata.com/quote?symbol=${symbol}&apikey=${ST.keys.twelve}`);
-            const d = await r.json();
-            if (d && d.close && !d.code) {
-                const pc = parseFloat(d.previous_close)||0;
-                const price = parseFloat(d.close);
-                return {
-                    price, change: price - pc, changePct: ((price-pc)/pc*100),
-                    open: parseFloat(d.open)||0, high: parseFloat(d.high)||0,
-                    low: parseFloat(d.low)||0, prevClose: pc, volume: parseFloat(d.volume)||0,
-                    name: d.name || '', exchange: d.exchange || '',
-                    source: 'Twelve Data'
-                };
-            }
-        } catch(e) {}
+    // NZX handling - some providers need different format
+    if (s.endsWith('.NZ')) {
+        const base = s.replace('.NZ', '');
+        variants.push(`${base}.NZX`, `NZX:${base}`, `${base}`);
     }
 
-    // 3. Try Finnhub (excellent for US, supports some international)
-    if (ST.keys.finnhub) {
-        try {
-            const [qr, pr] = await Promise.all([
-                fetch(`https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${ST.keys.finnhub}`),
-                fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${ST.keys.finnhub}`)
-            ]);
-            const q = await qr.json();
-            const p = await pr.json();
-            if (q && q.c && q.c > 0) {
-                return {
-                    price: q.c, change: q.d||0, changePct: q.dp||0,
-                    open: q.o||0, high: q.h||0, low: q.l||0, prevClose: q.pc||0,
-                    volume: 0, name: p.name||'', exchange: p.exchange||'',
-                    industry: p.finnhubIndustry||'', marketCap: p.marketCapitalization||0,
-                    source: 'Finnhub'
-                };
-            }
-        } catch(e) {}
+    // ASX handling
+    if (s.endsWith('.AX')) {
+        const base = s.replace('.AX', '');
+        variants.push(`${base}.AU`, `ASX:${base}`, `${base}`);
     }
 
-    // 4. Try Alpha Vantage (global support)
-    if (ST.keys.av) {
-        try {
-            const r = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${ST.keys.av}`);
-            const d = await r.json();
-            const q = d['Global Quote'];
-            if (q && q['05. price']) {
-                const price = parseFloat(q['05. price']);
-                const pc = parseFloat(q['08. previous close'])||price;
-                return {
-                    price, change: parseFloat(q['09. change'])||0,
-                    changePct: parseFloat(q['10. change percent'])||0,
-                    open: parseFloat(q['02. open'])||0, high: parseFloat(q['03. high'])||0,
-                    low: parseFloat(q['04. low'])||0, prevClose: pc,
-                    volume: parseFloat(q['06. volume'])||0, source: 'Alpha Vantage'
-                };
-            }
-        } catch(e) {}
+    // TSE (Japan) - numeric codes
+    if (s.endsWith('.T')) {
+        const base = s.replace('.T', '');
+        variants.push(`${base}.TSE`, `TSE:${base}`);
+    }
+
+    // HKEX - zero-padded codes
+    if (s.endsWith('.HK')) {
+        const base = s.replace('.HK', '');
+        // Try zero-padded variants
+        variants.push(base.padStart(4,'0') + '.HK', base.padStart(5,'0') + '.HK');
+    }
+
+    return [...new Set(variants)]; // deduplicate
+}
+
+// Parse a valid quote from various response shapes
+function parseQuoteResult(d, source) {
+    if (!d) return null;
+
+    // EODHD format
+    if (d.close !== undefined && d.close !== 'NA' && d.close !== null) {
+        const price = parseFloat(d.close);
+        if (!isNaN(price) && price > 0) {
+            return {
+                price, change: parseFloat(d.change)||0,
+                changePct: parseFloat(d.change_p)||0,
+                open: parseFloat(d.open)||0, high: parseFloat(d.high)||0,
+                low: parseFloat(d.low)||0, prevClose: parseFloat(d.previousClose)||parseFloat(d.prev_close)||0,
+                volume: parseFloat(d.volume)||0, source
+            };
+        }
+    }
+
+    // Twelve Data format
+    if (d.close !== undefined && d.previous_close !== undefined) {
+        const price = parseFloat(d.close);
+        const pc = parseFloat(d.previous_close)||price;
+        if (!isNaN(price) && price > 0 && !d.code) {
+            return {
+                price, change: price - pc,
+                changePct: pc > 0 ? ((price-pc)/pc*100) : 0,
+                open: parseFloat(d.open)||0, high: parseFloat(d.high)||0,
+                low: parseFloat(d.low)||0, prevClose: pc,
+                volume: parseFloat(d.volume)||0,
+                name: d.name||'', exchange: d.exchange||'', source
+            };
+        }
+    }
+
+    // Finnhub format (c = current price)
+    if (d.c !== undefined) {
+        const price = parseFloat(d.c);
+        if (!isNaN(price) && price > 0) {
+            return {
+                price, change: parseFloat(d.d)||0,
+                changePct: parseFloat(d.dp)||0,
+                open: parseFloat(d.o)||0, high: parseFloat(d.h)||0,
+                low: parseFloat(d.l)||0, prevClose: parseFloat(d.pc)||0,
+                volume: 0, source
+            };
+        }
+    }
+
+    // Alpha Vantage Global Quote format
+    if (d['Global Quote']) {
+        const q = d['Global Quote'];
+        if (q['05. price']) {
+            const price = parseFloat(q['05. price']);
+            const pc = parseFloat(q['08. previous close'])||price;
+            return {
+                price, change: parseFloat(q['09. change'])||0,
+                changePct: parseFloat(q['10. change percent'])||0,
+                open: parseFloat(q['02. open'])||0, high: parseFloat(q['03. high'])||0,
+                low: parseFloat(q['04. low'])||0, prevClose: pc,
+                volume: parseFloat(q['06. volume'])||0, source
+            };
+        }
     }
 
     return null;
 }
+
+async function fetchQuote(symbol) {
+    const variants = getSymbolVariants(symbol);
+    const debugLog = [];
+
+    // ── 1. EODHD (best for international, especially India/NZ/AU/Europe/Japan) ──
+    if (ST.keys.eodhd) {
+        for (const v of variants) {
+            try {
+                const eSym = toEODHD(v);
+                debugLog.push(`EODHD: trying ${eSym}`);
+                const r = await fetch(`https://eodhd.com/api/real-time/${eSym}?api_token=${ST.keys.eodhd}&fmt=json`);
+                const d = await r.json();
+                const result = parseQuoteResult(d, 'EODHD');
+                if (result) { result._debug = debugLog; return result; }
+                debugLog.push(`EODHD: no data for ${eSym}`);
+            } catch(e) { debugLog.push(`EODHD error: ${e.message}`); }
+        }
+    }
+
+    // ── 2. Twelve Data (excellent global coverage, 800 req/day free) ──
+    if (ST.keys.twelve) {
+        const twelveVariants = buildTwelveDataVariants(symbol);
+        for (const v of twelveVariants) {
+            try {
+                debugLog.push(`TwelveData: trying ${v}`);
+                const r = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(v)}&apikey=${ST.keys.twelve}`);
+                const d = await r.json();
+                const result = parseQuoteResult(d, 'Twelve Data');
+                if (result) { result._debug = debugLog; return result; }
+                debugLog.push(`TwelveData: no data for ${v} (${d?.message||d?.code||'unknown'})`);
+            } catch(e) { debugLog.push(`TwelveData error: ${e.message}`); }
+        }
+    }
+
+    // ── 3. Finnhub (US + some international via exchange prefix) ──
+    if (ST.keys.finnhub) {
+        // Finnhub uses exchange prefix format: NSE:RELIANCE, not RELIANCE.NS
+        const finnhubVariants = buildFinnhubVariants(symbol);
+        for (const v of finnhubVariants) {
+            try {
+                debugLog.push(`Finnhub: trying ${v}`);
+                const qr = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(v)}&token=${ST.keys.finnhub}`);
+                const q = await qr.json();
+                const result = parseQuoteResult(q, 'Finnhub');
+                if (result) {
+                    // Enrich with profile if it's the primary symbol
+                    try {
+                        const pr = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(v)}&token=${ST.keys.finnhub}`);
+                        const p = await pr.json();
+                        if (p && p.name) {
+                            result.name = p.name;
+                            result.exchange = p.exchange;
+                            result.industry = p.finnhubIndustry;
+                            result.marketCap = p.marketCapitalization;
+                        }
+                    } catch(e) {}
+                    result._debug = debugLog;
+                    return result;
+                }
+                debugLog.push(`Finnhub: no data for ${v}`);
+            } catch(e) { debugLog.push(`Finnhub error: ${e.message}`); }
+        }
+    }
+
+    // ── 4. Alpha Vantage (global, 5 req/min free) ──
+    if (ST.keys.av) {
+        for (const v of variants.slice(0, 2)) {
+            try {
+                debugLog.push(`AlphaVantage: trying ${v}`);
+                const r = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(v)}&apikey=${ST.keys.av}`);
+                const d = await r.json();
+                const result = parseQuoteResult(d, 'Alpha Vantage');
+                if (result) { result._debug = debugLog; return result; }
+                debugLog.push(`AlphaVantage: no data for ${v}`);
+            } catch(e) { debugLog.push(`AlphaVantage error: ${e.message}`); }
+        }
+    }
+
+    // ── 5. FMP (Financial Modeling Prep - good for US + some international) ──
+    if (ST.keys.fmp) {
+        try {
+            debugLog.push(`FMP: trying ${symbol}`);
+            const r = await fetch(`https://financialmodelingprep.com/api/v3/quote/${encodeURIComponent(symbol)}?apikey=${ST.keys.fmp}`);
+            const d = await r.json();
+            if (d && d[0] && d[0].price) {
+                const q = d[0];
+                return {
+                    price: q.price, change: q.change||0, changePct: q.changesPercentage||0,
+                    open: q.open||0, high: q.dayHigh||0, low: q.dayLow||0,
+                    prevClose: q.previousClose||0, volume: q.volume||0,
+                    name: q.name||'', exchange: q.exchange||'',
+                    source: 'FMP', _debug: debugLog
+                };
+            }
+        } catch(e) { debugLog.push(`FMP error: ${e.message}`); }
+    }
+
+    // ── 6. Polygon.io (US stocks and crypto) ──
+    if (ST.keys.polygon) {
+        try {
+            const ticker = symbol.split('.')[0]; // Polygon uses plain tickers for US
+            debugLog.push(`Polygon: trying ${ticker}`);
+            const r = await fetch(`https://api.polygon.io/v2/aggs/ticker/${ticker}/prev?apiKey=${ST.keys.polygon}`);
+            const d = await r.json();
+            if (d && d.results && d.results[0]) {
+                const q = d.results[0];
+                const price = q.c;
+                const pc = q.o;
+                return {
+                    price, change: price - pc,
+                    changePct: pc > 0 ? ((price-pc)/pc*100) : 0,
+                    open: q.o||0, high: q.h||0, low: q.l||0,
+                    prevClose: pc, volume: q.v||0,
+                    source: 'Polygon', _debug: debugLog
+                };
+            }
+        } catch(e) { debugLog.push(`Polygon error: ${e.message}`); }
+    }
+
+    // All providers exhausted — return null with debug info
+    return { _failed: true, _debug: debugLog, _symbol: symbol, _variants: variants };
+}
+
+// Build Finnhub-specific symbol variants
+// Finnhub uses: NSE:RELIANCE, BINANCE:BTCUSDT, etc.
+function buildFinnhubVariants(symbol) {
+    const s = symbol.toUpperCase();
+    const variants = [s];
+
+    if (s.endsWith('.NS')) {
+        const base = s.replace('.NS', '');
+        variants.unshift(`NSE:${base}`); // Finnhub prefers this
+    } else if (s.endsWith('.BO')) {
+        const base = s.replace('.BO', '');
+        variants.unshift(`BSE:${base}`);
+    } else if (s.endsWith('.NZ')) {
+        const base = s.replace('.NZ', '');
+        variants.push(`NZX:${base}`);
+    } else if (s.endsWith('.AX')) {
+        const base = s.replace('.AX', '');
+        variants.push(`ASX:${base}`);
+    } else if (s.endsWith('.L')) {
+        const base = s.replace('.L', '');
+        variants.push(`LSE:${base}`);
+    } else if (s.endsWith('.T')) {
+        const base = s.replace('.T', '');
+        variants.push(`TSE:${base}`);
+    } else if (s.endsWith('.HK')) {
+        const base = s.replace('.HK', '');
+        variants.push(`HKEX:${base}`);
+    } else if (s.endsWith('.DE')) {
+        const base = s.replace('.DE', '');
+        variants.push(`XETRA:${base}`);
+    }
+
+    return variants;
+}
+
+function buildTwelveDataVariants(symbol) {
+    // Twelve Data uses SYMBOL:EXCHANGE format for international
+    const s = symbol.toUpperCase();
+    const variants = [s];
+
+    const map = {
+        '.NS':  ['RELIANCE:NSE', '{BASE}:NSE'],   // template
+        '.BO':  ['{BASE}:BSE'],
+        '.NZ':  ['{BASE}:NZX'],
+        '.AX':  ['{BASE}:ASX'],
+        '.L':   ['{BASE}:LSE'],
+        '.DE':  ['{BASE}:XETRA'],
+        '.PA':  ['{BASE}:EURONEXT'],
+        '.AS':  ['{BASE}:EURONEXT'],
+        '.SW':  ['{BASE}:SIX'],
+        '.T':   ['{BASE}:TSE'],
+        '.HK':  ['{BASE}:HKEX'],
+        '.SI':  ['{BASE}:SGX'],
+        '.KS':  ['{BASE}:KRX'],
+        '.SA':  ['{BASE}:BOVESPA'],
+        '.TO':  ['{BASE}:TSX'],
+    };
+
+    for (const [suffix, templates] of Object.entries(map)) {
+        if (s.endsWith(suffix.toUpperCase())) {
+            const base = s.slice(0, -suffix.length);
+            templates.forEach(t => {
+                variants.unshift(t.replace('{BASE}', base));
+            });
+            variants.push(base); // plain base as last resort
+            break;
+        }
+    }
+    return [...new Set(variants)];
+}
+
 
 async function fetchCompanyProfile(symbol) {
     if (ST.keys.fmp) {
@@ -1520,6 +1745,9 @@ async function processCmd(raw) {
 
     // ─── ROUTING ─────────────────────────────────
     switch(verb) {
+        case 'DIAG':
+        case 'DEBUG':   await showDiagnostics(arg1); break;
+        case 'TEST':    await testSymbol(arg1||'AAPL'); break;
         case 'HELP':    showHelp(); break;
         case 'MKTS':
         case 'MARKETS': showMarkets(); break;
@@ -1581,13 +1809,54 @@ async function showEquity(symbol) {
 
     clearOut();
 
-    if (!data) {
+    if (!data || data._failed) {
         out(`<div class="sec-hdr red">${symbol} — ${exInfo.flag} ${exInfo.name}</div>`);
+
+        // Build symbol suggestions
+        const base = symbol.split('.')[0];
+        const suggestions = [];
+        if (!symbol.includes('.')) {
+            suggestions.push(`${base}.NS (NSE India)`, `${base}.BO (BSE India)`, `${base}.NZ (NZX)`, `${base}.AX (ASX)`, `${base}.L (LSE)`);
+        }
+
+        // Show debug log so user knows what was tried
+        const debugInfo = data?._debug || [];
+        const variantsTried = data?._variants || [symbol];
+
         out(`<div class="info-box warn">
-            ⚠ No live data for <strong>${symbol}</strong>. 
-            ${hasApiKeys() ? 'Check the symbol format or try a different provider.' : 'Add API keys in <span class="sym-pill" onclick="openSetup()">SETUP</span> to enable live data.'}
-            <br><br>
-            Symbol format guide: US (AAPL) · NSE (RELIANCE.NS) · NZX (AIR.NZ) · ASX (BHP.AX) · LSE (BARC.L) · XETRA (SAP.DE) · TSE (7203.T) · HKEX (0700.HK)
+            <div style="color:var(--amber);font-weight:700;margin-bottom:8px;">⚠ No data returned for <span style="color:var(--blue);">${symbol}</span></div>
+
+            <div style="margin-bottom:10px;">
+                <strong style="color:var(--green-bright);">What was tried:</strong><br>
+                <div style="color:#666;font-size:10px;margin-top:4px;line-height:1.8;">
+                    ${debugInfo.length ? debugInfo.map(d => `• ${d}`).join('<br>') : '• No API keys configured — add keys in SETUP'}
+                </div>
+            </div>
+
+            <div style="margin-bottom:10px;">
+                <strong style="color:var(--green-bright);">Symbol variants attempted:</strong>
+                <div style="color:#888;font-size:10px;margin-top:2px;">${variantsTried.join(' · ')}</div>
+            </div>
+
+            ${suggestions.length ? `<div style="margin-bottom:10px;">
+                <strong style="color:var(--green-bright);">Did you mean?</strong><br>
+                ${suggestions.map(s => `<span class="sym-pill" onclick="run('${s.split(' ')[0]}')">${s}</span>`).join(' ')}
+            </div>` : ''}
+
+            <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+                <strong style="color:var(--amber);">HOW TO FIX:</strong><br>
+                <div style="font-size:10px;line-height:1.9;margin-top:4px;">
+                    <strong>For Indian NSE stocks:</strong> Use <span style="color:var(--blue);">RELIANCE.NS</span> · <span style="color:var(--blue);">TCS.NS</span> · <span style="color:var(--blue);">LT.NS</span> — requires <strong>EODHD</strong> or <strong>Twelve Data</strong> or <strong>Alpha Vantage</strong> key<br>
+                    <strong>For NZX stocks:</strong> Use <span style="color:var(--blue);">AIR.NZ</span> · <span style="color:var(--blue);">FPH.NZ</span> — requires <strong>EODHD</strong> or <strong>Twelve Data</strong> key<br>
+                    <strong>For ASX stocks:</strong> Use <span style="color:var(--blue);">BHP.AX</span> · <span style="color:var(--blue);">CBA.AX</span> — requires <strong>EODHD</strong> or <strong>Twelve Data</strong> key<br>
+                    <strong>For US stocks:</strong> Use plain ticker <span style="color:var(--blue);">AAPL</span> — works with <strong>Finnhub</strong>, <strong>Alpha Vantage</strong>, or <strong>Twelve Data</strong><br><br>
+                    <strong style="color:var(--amber);">Best free keys for international:</strong><br>
+                    🥇 <strong>EODHD</strong> (eodhd.com) — best for India/NZ/AU/Europe/Japan, 20 req/day free<br>
+                    🥈 <strong>Twelve Data</strong> (twelvedata.com) — 800 req/day free, excellent global coverage<br>
+                    🥉 <strong>Alpha Vantage</strong> (alphavantage.co) — 5 req/min free, global<br><br>
+                    Click <span class="sym-pill" onclick="openSetup()">⚙ SETUP</span> to add or update your API keys.
+                </div>
+            </div>
         </div>`);
         return;
     }
@@ -2564,6 +2833,189 @@ function showHeatmap() {
             }).join('')}
         </div>
     </div>`);
+}
+
+// ═══ DIAGNOSTICS ═════════════════════════════════
+async function showDiagnostics(symbol) {
+    clearOut();
+    out(`<div class="sec-hdr amber">⚙ API DIAGNOSTICS</div>`);
+
+    const keys = ST.keys;
+    const keyStatus = [
+        { name:'Finnhub', key: keys.finnhub, url:'https://finnhub.io/api/v1/quote?symbol=AAPL&token=', best:'US equities, news, insider data' },
+        { name:'EODHD', key: keys.eodhd, url:'https://eodhd.com/api/real-time/AAPL.US?api_token=', best:'India NSE/BSE, NZX, ASX, Europe, Japan' },
+        { name:'Twelve Data', key: keys.twelve, url:'https://api.twelvedata.com/price?symbol=AAPL&apikey=', best:'Best overall global coverage' },
+        { name:'Alpha Vantage', key: keys.av, url:'https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=AAPL&apikey=', best:'Global, fundamentals' },
+        { name:'FMP', key: keys.fmp, url:null, best:'Financial statements, ratios' },
+        { name:'CoinGecko', key: keys.coingecko||'(free)', url:null, best:'All crypto data' },
+        { name:'FRED', key: keys.fred, url:null, best:'US macro / economic data' },
+    ];
+
+    out(`<div class="info-box" style="margin-bottom:10px;">
+        <strong style="color:var(--amber);">CONFIGURED API KEYS</strong><br><br>
+        <table class="dt" style="width:auto;">
+        <tr><th>Provider</th><th>Key Status</th><th>Best For</th></tr>
+        ${keyStatus.map(k => {
+            const hasKey = k.key && k.key.length > 3;
+            return `<tr>
+                <td style="font-weight:700;">${k.name}</td>
+                <td class="${hasKey?'up':'dn'}">${hasKey ? '✓ CONFIGURED (' + k.key.slice(0,6) + '...)' : '✗ NOT SET'}</td>
+                <td style="color:#888;font-size:10px;">${k.best}</td>
+            </tr>`;
+        }).join('')}
+        </table>
+    </div>`);
+
+    // Live connectivity tests
+    out(`<div style="color:var(--amber);margin:10px 0 6px;font-size:11px;">LIVE CONNECTIVITY TESTS</div>`);
+    out(`<div id="diagResults"></div>`);
+
+    const diagEl = document.getElementById('diagResults');
+
+    const tests = [
+        { name:'CoinGecko (no key)', fn: async () => {
+            const r = await fetch('https://api.coingecko.com/api/v3/ping');
+            const d = await r.json();
+            return d.gecko_says ? `OK — ${d.gecko_says}` : 'Response received';
+        }},
+    ];
+
+    if (keys.finnhub) tests.push({ name:'Finnhub — US (AAPL)', fn: async () => {
+        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=AAPL&token=${keys.finnhub}`);
+        const d = await r.json();
+        if (d.c > 0) return `OK — AAPL = $${d.c.toFixed(2)}`;
+        return `ERROR — ${JSON.stringify(d).slice(0,80)}`;
+    }});
+
+    if (keys.finnhub) tests.push({ name:'Finnhub — India NSE (NSE:RELIANCE)', fn: async () => {
+        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=NSE:RELIANCE&token=${keys.finnhub}`);
+        const d = await r.json();
+        if (d.c > 0) return `OK — RELIANCE = ₹${d.c.toFixed(2)}`;
+        return `FAIL — Finnhub may not support this exchange on your plan. Try EODHD or Twelve Data instead.`;
+    }});
+
+    if (keys.eodhd) tests.push({ name:'EODHD — India NSE (RELIANCE.NSE)', fn: async () => {
+        const r = await fetch(`https://eodhd.com/api/real-time/RELIANCE.NSE?api_token=${keys.eodhd}&fmt=json`);
+        const d = await r.json();
+        if (d.close && d.close !== 'NA') return `OK — RELIANCE = ₹${parseFloat(d.close).toFixed(2)}`;
+        return `FAIL — ${JSON.stringify(d).slice(0,100)}`;
+    }});
+
+    if (keys.eodhd) tests.push({ name:'EODHD — NZX (AIR.NZX)', fn: async () => {
+        const r = await fetch(`https://eodhd.com/api/real-time/AIR.NZX?api_token=${keys.eodhd}&fmt=json`);
+        const d = await r.json();
+        if (d.close && d.close !== 'NA') return `OK — AIR = NZ$${parseFloat(d.close).toFixed(2)}`;
+        return `FAIL — ${JSON.stringify(d).slice(0,100)}`;
+    }});
+
+    if (keys.eodhd) tests.push({ name:'EODHD — ASX (BHP.AU)', fn: async () => {
+        const r = await fetch(`https://eodhd.com/api/real-time/BHP.AU?api_token=${keys.eodhd}&fmt=json`);
+        const d = await r.json();
+        if (d.close && d.close !== 'NA') return `OK — BHP = A$${parseFloat(d.close).toFixed(2)}`;
+        return `FAIL — ${JSON.stringify(d).slice(0,100)}`;
+    }});
+
+    if (keys.twelve) tests.push({ name:'Twelve Data — India NSE (RELIANCE:NSE)', fn: async () => {
+        const r = await fetch(`https://api.twelvedata.com/price?symbol=RELIANCE:NSE&apikey=${keys.twelve}`);
+        const d = await r.json();
+        if (d.price) return `OK — RELIANCE = ₹${parseFloat(d.price).toFixed(2)}`;
+        return `FAIL — ${d.message||d.code||JSON.stringify(d).slice(0,100)}`;
+    }});
+
+    if (keys.av) tests.push({ name:'Alpha Vantage — US (AAPL)', fn: async () => {
+        const r = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=AAPL&apikey=${keys.av}`);
+        const d = await r.json();
+        const q = d['Global Quote'];
+        if (q && q['05. price']) return `OK — AAPL = $${parseFloat(q['05. price']).toFixed(2)}`;
+        return `FAIL — ${d['Note']||d['Information']||JSON.stringify(d).slice(0,100)}`;
+    }});
+
+    for (const test of tests) {
+        diagEl.innerHTML += `<div style="padding:4px 0;font-size:11px;border-bottom:1px solid var(--border);">
+            <span style="color:#666;">${test.name}:</span>
+            <span id="diag_${test.name.replace(/[^A-Z0-9]/gi,'_')}" class="loading">Testing...</span>
+        </div>`;
+        try {
+            const result = await test.fn();
+            const el = document.getElementById('diag_' + test.name.replace(/[^A-Z0-9]/gi,'_'));
+            if (el) el.innerHTML = `<span class="${result.startsWith('OK')?'up':'dn'}">${result}</span>`;
+        } catch(e) {
+            const el = document.getElementById('diag_' + test.name.replace(/[^A-Z0-9]/gi,'_'));
+            if (el) el.innerHTML = `<span class="dn">ERROR: ${e.message}</span>`;
+        }
+        await sleep(400);
+    }
+
+    out(`<div class="info-box info" style="margin-top:12px;">
+        <strong>TROUBLESHOOTING GUIDE FOR INDIAN STOCKS</strong><br><br>
+        Finnhub: Use <span style="color:var(--blue);">NSE:RELIANCE</span> format (not RELIANCE.NS)<br>
+        EODHD: Use <span style="color:var(--blue);">RELIANCE.NSE</span> format (not RELIANCE.NS) — terminal auto-converts<br>
+        Twelve Data: Use <span style="color:var(--blue);">RELIANCE:NSE</span> format — terminal auto-converts<br>
+        Alpha Vantage: Use <span style="color:var(--blue);">RELIANCE.BSE</span> format — terminal auto-converts<br><br>
+        <strong>The terminal auto-tries all formats</strong>, so just type <span style="color:var(--blue);">RELIANCE.NS</span> and it will try all variants automatically.
+    </div>`);
+}
+
+async function testSymbol(symbol) {
+    clearOut();
+    out(`<div class="sec-hdr">TEST: ${symbol} — Trying all providers...</div>`);
+    out(`<div id="testResults" style="font-size:11px;"></div>`);
+
+    const el = document.getElementById('testResults');
+    const variants = getSymbolVariants(symbol);
+    out(`<div style="color:#666;font-size:10px;margin-bottom:8px;">Variants to try: ${variants.join(' · ')}</div>`);
+
+    const providers = [];
+    if (ST.keys.eodhd) providers.push({ name:'EODHD', fn: async (v) => {
+        const s = toEODHD(v);
+        const r = await fetch(`https://eodhd.com/api/real-time/${s}?api_token=${ST.keys.eodhd}&fmt=json`);
+        return [s, await r.json()];
+    }});
+    if (ST.keys.twelve) providers.push({ name:'Twelve Data', fn: async (v) => {
+        const r = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(v)}&apikey=${ST.keys.twelve}`);
+        return [v, await r.json()];
+    }});
+    if (ST.keys.finnhub) providers.push({ name:'Finnhub', fn: async (v) => {
+        const fv = buildFinnhubVariants(v)[0];
+        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(fv)}&token=${ST.keys.finnhub}`);
+        return [fv, await r.json()];
+    }});
+    if (ST.keys.av) providers.push({ name:'Alpha Vantage', fn: async (v) => {
+        const r = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(v)}&apikey=${ST.keys.av}`);
+        return [v, await r.json()];
+    }});
+
+    if (!providers.length) {
+        out(`<div class="info-box warn">No API keys configured. Add keys in SETUP.</div>`);
+        return;
+    }
+
+    for (const prov of providers) {
+        for (const v of variants.slice(0,4)) {
+            const rowId = `test_${prov.name}_${v}`.replace(/[^A-Z0-9]/gi,'_');
+            el.innerHTML += `<div id="${rowId}" style="padding:3px 0;border-bottom:1px solid #111;">
+                <span style="color:var(--amber);">${prov.name}</span> → <span style="color:var(--blue);">${v}</span>:
+                <span class="loading">...</span>
+            </div>`;
+            try {
+                const [tried, data] = await prov.fn(v);
+                const result = parseQuoteResult(data, prov.name);
+                const rowEl = document.getElementById(rowId);
+                if (rowEl) {
+                    if (result) {
+                        rowEl.innerHTML = `<span style="color:var(--amber);">${prov.name}</span> → <span style="color:var(--blue);">${tried}</span>: <span class="up">✓ PRICE = ${result.price.toFixed(2)} (${fmtPct(result.changePct)})</span>`;
+                    } else {
+                        const preview = JSON.stringify(data).slice(0,120);
+                        rowEl.innerHTML = `<span style="color:var(--amber);">${prov.name}</span> → <span style="color:var(--blue);">${tried}</span>: <span style="color:#444;">✗ ${preview}</span>`;
+                    }
+                }
+            } catch(e) {
+                const rowEl = document.getElementById(rowId);
+                if (rowEl) rowEl.innerHTML = `<span style="color:var(--amber);">${prov.name}</span> → <span style="color:var(--blue);">${v}</span>: <span class="dn">ERROR: ${e.message}</span>`;
+            }
+            await sleep(300);
+        }
+    }
 }
 
 // ═══ HELP ═════════════════════════════════════════
