@@ -1752,3 +1752,79 @@
 </body>
 </html>
 
+<!DOCTYPE html>
+<html>
+<head>
+    <title>NZX Bloomberg Terminal Pro</title>
+    <!-- Same styles as before -->
+    <style>/* Your existing CSS here */</style>
+</head>
+<body>
+    <!-- Same HTML structure -->
+    
+    <script>
+        // NZX Tickers (NZX 50 top performers)
+        const NZX_TICKERS = {
+            'FPH.NZ': 'Fisher & Paykel Healthcare',
+            'SPK.NZ': 'Spark New Zealand', 
+            'ATM.NZ': 'Auckland Intl Airport',
+            'AIR.NZ': 'Air New Zealand',
+            'NZX.NZ': 'NZX Limited'
+        };
+
+        // Multi-API fallback
+        async function getNZXQuote(symbol) {
+            const apis = [
+                // 1. Finnhub (primary)
+                () => `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${CONFIG.apiKeys.finnhub}`,
+                // 2. Alpha Vantage
+                () => `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${CONFIG.apiKeys.alphaVantage}`,
+                // 3. Yahoo fallback (via proxy)
+                () => `https://query1.finance.yahoo.com/v8/finance/chart/${symbol.replace('.NZ', '')}.NZ`
+            ];
+
+            for (let api of apis) {
+                try {
+                    const data = await fetch(api());
+                    if (data.ok) return await data.json();
+                } catch (e) {
+                    console.log(`API ${api.name} failed:`, e);
+                }
+            }
+            return { error: 'No data available' };
+        }
+
+        // Updated equity load with NZX
+        async function loadEquity(symbol) {
+            printOutput(`Loading ${symbol}...\n`);
+            
+            if (symbol.endsWith('.NZ')) {
+                const data = await getNZXQuote(symbol);
+                if (data.c || data['Global Quote']) {
+                    printOutput(`
+<div class="section-header">${symbol} NZX - LIVE DATA</div>
+<div class="price-card">
+    <div class="symbol">${symbol}</div>
+    <div>${NZX_TICKERS[symbol] || 'NZX Stock'}</div>
+    <div class="price positive">$${data.c || data['Global Quote']['05. price']}</div>
+</div>`);
+                } else {
+                    printOutput(`<span class="text-warning">NZX ${symbol} data limited. Try FPH.NZ, SPK.NZ</span>`);
+                }
+            } else {
+                // US stocks (existing Finnhub logic)
+                await fetchRealData(symbol);
+            }
+        }
+
+        // Add NZX to watchlist
+        const NZX_WATCHLIST = [
+            { symbol: 'FPH.NZ', name: 'Fisher & Paykel', change: '+1.2%' },
+            { symbol: 'SPK.NZ', name: 'Spark NZ', change: '-0.5%' },
+            { symbol: 'ATM.NZ', name: 'Auckland Airport', change: '+0.8%' }
+        ];
+
+        // Rest of your existing code...
+    </script>
+</body>
+</html>
